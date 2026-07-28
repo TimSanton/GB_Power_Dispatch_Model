@@ -48,9 +48,6 @@ deliberately excluded.
 
 ## Interconnectors
 
-The interconnectors are the part worth explaining, because treating them
-naively is the easiest way to get GB prices wrong.
-
 A link is not a generator. Power flows toward the dearer market, so at a
 candidate GB price `p` a link supplies GB when its continental price is at or
 below `p`, and draws from GB when it is above. Modelling links as supply only
