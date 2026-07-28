@@ -7,18 +7,27 @@ dispatch model, and writes a formatted Excel output file.
 Data sources:
   - NESO: 2-14 day ahead demand, transmission wind, embedded wind/solar
   - Elexon FOU2T14D: nuclear, biomass and interconnector availability 2-14 days ahead
+  - ENTSO-E: day-ahead prices for the interconnector counterparty bidding
+    zones, used to shape import prices across the day
+  - ECB: EUR/GBP reference rate
 
 Run:
+    export ENTSOE_API_TOKEN=...   # free from transparency.entsoe.eu
     python run_model.py
 
+Without ENTSOE_API_TOKEN the model still runs, but falls back to flat
+interconnector import prices, which materially flattens the GB price.
+
 Requires:
-    pip install requests pandas openpyxl numpy
+    pip install requests pandas openpyxl
 
 Output:
     gb_power_model_YYYYMMDD_HHMM.xlsx
 """
 
+import os
 import re
+import xml.etree.ElementTree as ET
 
 import requests
 import pandas as pd
@@ -63,23 +72,40 @@ NUCLEAR_GW             = 6.4    # Active installed capacity (fallback if FOU2T14
 # Hydro: NPSHYD (run-of-river/reservoir) + PS (pumped storage)
 # Registered from Elexon BM Units 2025: NPSHYD ~1.0 GW, PS ~3.1 GW
 HYDRO_AVG_GW           = 4.1   # fallback if FOU2T14D unavailable
-# Interconnector tranches — each link connects to a different market with a different price
-# Capacities: registered GB interconnector capacities (GW)
-# Prices: assumed Continental baseload price for the forecast period (£/MWh, your view)
-# Format: (capacity_gw, assumed_import_price, label)
-# Interconnector tranches
-# Format: (registered_capacity_gw, assumed_import_price, label, fou2t14d_fuel_types)
-# Capacities are registered maximums — live availability comes from Elexon FOU2T14D
-# France uses two codes (INTFR=IFA1+IFA2, INTELEC=ElecLink) — summed per SP
-# Ireland uses two codes (INTIRL=Moyle, INTEW=EWIC) — summed per SP
+# Interconnector tranches — each link connects to a different market with its
+# own price. Capacities are registered maximums; live availability comes from
+# Elexon FOU2T14D.
+#
+# Import prices are built as  level x intraday shape  (see build_ic_price_shapes):
+#   shape — per settlement period, from a trailing window of ENTSO-E day-ahead
+#           prices for the counterparty bidding zone, split weekday/weekend.
+#           Continental shape is severe now: midday collapses toward (or below)
+#           zero on solar, evening peaks near 2x the daily mean.
+#   level — FORWARD_LEVEL below when set, otherwise the trailing realised mean.
+#           Day-ahead prices do not exist for a 3-14 day ahead window, so set
+#           FORWARD_LEVEL from a forward curve or your own view when you have
+#           one; the trailing mean is only a proxy.
+#
+# France sums three codes (INTFR=IFA1, INTIFA2, INTELEC=ElecLink).
+# Ireland sums three (INTIRL=Moyle, INTEW=EWIC, INTGRNL=Greenlink).
+# Format: (capacity_gw, forward_level_gbp_mwh, label, fou2t14d_fuel_types, entsoe_eic)
 INTERCONNECTORS = [
-    (1.4, 40.0, "Interconnector NO", ["INTNSL"]),           # North Sea Link Norway
-    (1.5, 45.0, "Interconnector DK", ["INTVKL"]),           # VikingLink Denmark
-    (4.1, 50.0, "Interconnector FR", ["INTFR", "INTIFA2", "INTELEC"]), # IFA1 (2.0GW) + IFA2 (1.1GW) + ElecLink (1.0GW)
-    (1.0, 53.0, "Interconnector BE", ["INTNEM"]),           # Nemo Belgium
-    (1.2, 56.0, "Interconnector NL", ["INTNED"]),           # BritNed Netherlands
-    (1.3, 62.0, "Interconnector IE", ["INTIRL", "INTEW", "INTGRNL"]),  # Moyle (0.4GW)+EWIC (0.5GW)+Greenlink (0.5GW) Ireland
+    (1.4, None, "Interconnector NO", ["INTNSL"], "10YNO-2--------T"),   # North Sea Link Norway (NO2)
+    (1.5, None, "Interconnector DK", ["INTVKL"], "10YDK-1--------W"),   # VikingLink Denmark (DK1)
+    (4.1, None, "Interconnector FR", ["INTFR", "INTIFA2", "INTELEC"], "10YFR-RTE------C"), # IFA1 2.0 + IFA2 1.1 + ElecLink 1.0 GW
+    (1.0, None, "Interconnector BE", ["INTNEM"], "10YBE----------2"),   # Nemo Belgium
+    (1.2, None, "Interconnector NL", ["INTNED"], "10YNL----------L"),   # BritNed Netherlands
+    (1.3, None, "Interconnector IE", ["INTIRL", "INTEW", "INTGRNL"], "10Y1001A1001A59C"),  # Moyle 0.4 + EWIC 0.5 + Greenlink 0.5 GW (SEM)
 ]
+# Fallback import prices (£/MWh) used only when ENTSO-E is unavailable — flat,
+# and therefore a poor approximation of a shaped continental price.
+IC_FALLBACK_PRICE = {
+    "Interconnector NO": 87.0, "Interconnector DK": 88.0,
+    "Interconnector FR": 80.0, "Interconnector BE": 95.0,
+    "Interconnector NL": 91.0, "Interconnector IE": 130.0,
+}
+# Trailing window (days) used to estimate interconnector price level and shape
+IC_SHAPE_DAYS          = 30
 CCGT_VOM               = 5.00   # DESNZ 2025 generation costs, all gas plant (£/MWh, 2024 prices)
 OCGT_VOM               = 5.0
 # Nuclear and hydro VOM: no public DESNZ source — commercially confidential.
@@ -113,6 +139,137 @@ EMBEDDED_RESOURCE      = "db6c038f-98af-4570-ab60-24d71ebd0ae5"  # embedded wind
 
 # Elexon Insights API
 ELEXON_API             = "https://data.elexon.co.uk/bmrs/api/v1"
+
+# ENTSO-E Transparency Platform — day-ahead prices for the counterparty
+# bidding zones. Needs a free registration token, read from the environment;
+# never hardcode it here.
+ENTSOE_API             = "https://web-api.tp.entsoe.eu/api"
+ENTSOE_TOKEN_ENV       = "ENTSOE_API_TOKEN"
+ENTSOE_RESOLUTION      = {"PT15M": 15, "PT30M": 30, "PT60M": 60, "PT1H": 60}
+
+# ECB daily reference rates — EUR/GBP for converting continental prices
+ECB_FX_API             = ("https://data-api.ecb.europa.eu/service/data/EXR/"
+                          "D.GBP.EUR.SP00.A")
+EUR_GBP_FALLBACK       = 0.855
+
+
+def fetch_eur_gbp() -> float:
+    """Latest ECB EUR->GBP reference rate, falling back to a fixed rate."""
+    try:
+        r = requests.get(ECB_FX_API,
+                         params={"lastNObservations": 1, "format": "csvdata"},
+                         timeout=30)
+        r.raise_for_status()
+        rows = r.text.strip().splitlines()
+        cols = rows[0].split(",")
+        rate = float(rows[1].split(",")[cols.index("OBS_VALUE")])
+        print(f"  EUR/GBP (ECB): {rate}")
+        return rate
+    except Exception as e:
+        print(f"  ECB FX lookup failed ({e}); using {EUR_GBP_FALLBACK}")
+        return EUR_GBP_FALLBACK
+
+
+def fetch_entsoe_da_prices(eic: str, start: date, end: date,
+                           token: str) -> pd.Series:
+    """
+    Day-ahead prices (EUR/MWh) for one bidding zone, as a UTC-indexed Series.
+
+    The A44 document carries one or more TimeSeries whose resolution varies by
+    zone (PT15M for the CWE zones, PT60M for SEM). Points use curveType A03,
+    where a price holds until the next stated position, so positions can be
+    sparse and must be forward-filled onto the full grid — reading the points
+    in listed order would misalign the series.
+    """
+    r = requests.get(ENTSOE_API, params={
+        "securityToken": token,
+        "documentType":  "A44",
+        "in_Domain":     eic,
+        "out_Domain":    eic,
+        "periodStart":   start.strftime("%Y%m%d%H%M"),
+        "periodEnd":     end.strftime("%Y%m%d%H%M"),
+    }, timeout=90)
+    if r.status_code != 200:
+        # Deliberately not raise_for_status: its message embeds the request
+        # URL, which carries the security token.
+        raise RuntimeError(f"ENTSO-E returned HTTP {r.status_code}")
+    root = ET.fromstring(r.text)
+    ns = {"n": root.tag.split("}")[0].strip("{")}
+    chunks = []
+    for ts in root.findall("n:TimeSeries", ns):
+        for per in ts.findall("n:Period", ns):
+            res = ENTSOE_RESOLUTION[per.find("n:resolution", ns).text]
+            t0  = pd.Timestamp(per.find("n:timeInterval/n:start", ns).text)
+            t1  = pd.Timestamp(per.find("n:timeInterval/n:end", ns).text)
+            n   = int((t1 - t0).total_seconds() // 60 // res)
+            grid = pd.Series(index=range(1, n + 1), dtype=float)
+            for p in per.findall("n:Point", ns):
+                grid[int(p.find("n:position", ns).text)] = \
+                    float(p.find("n:price.amount", ns).text)
+            grid = grid.ffill()
+            chunks.append(pd.Series(
+                grid.values,
+                index=pd.date_range(t0, periods=n, freq=f"{res}min", tz="UTC")))
+    if not chunks:
+        return pd.Series(dtype=float)
+    s = pd.concat(chunks).sort_index()
+    return s[~s.index.duplicated(keep="last")]
+
+
+def build_ic_price_shapes() -> dict:
+    """
+    Build an import price for every interconnector and settlement period.
+
+    Returns {label: {(is_weekend, sp): price_gbp_mwh}}. The level is
+    FORWARD_LEVEL where set, else the trailing realised mean; the shape is the
+    trailing mean ratio to daily mean, by settlement period, split
+    weekday/weekend because continental weekend middays sit far lower.
+
+    Any zone that cannot be fetched falls back to a flat IC_FALLBACK_PRICE.
+    """
+    token = os.environ.get(ENTSOE_TOKEN_ENV)
+    flat = {lab: {(w, sp): IC_FALLBACK_PRICE[lab]
+                  for w in (False, True) for sp in range(1, 49)}
+            for _, _, lab, _, _ in INTERCONNECTORS}
+    if not token:
+        print(f"  {ENTSOE_TOKEN_ENV} not set — using flat fallback import prices")
+        return flat
+
+    fx    = fetch_eur_gbp()
+    end   = date.today()
+    start = end - timedelta(days=IC_SHAPE_DAYS)
+    shapes = {}
+    for cap_gw, fwd_level, label, _, eic in INTERCONNECTORS:
+        try:
+            print(f"  Fetching ENTSO-E day-ahead {label} ({eic})...")
+            s = fetch_entsoe_da_prices(eic, start, end, token)
+            if s.empty:
+                raise ValueError("no price points returned")
+            loc = s.tz_convert("Europe/London")
+            # Hourly zones (SEM) upsample by holding the price across the hour
+            hh = loc.resample("30min").mean().ffill() * fx
+            sp = hh.index.hour * 2 + (hh.index.minute >= 30).astype(int) + 1
+            daily = hh.groupby(hh.index.date).transform("mean")
+            ratio = hh / daily
+            wknd  = hh.index.dayofweek >= 5
+            level = fwd_level if fwd_level is not None else float(hh.mean())
+            by_sp = {}
+            for is_wknd in (False, True):
+                mask = wknd if is_wknd else ~wknd
+                grp  = ratio[mask].groupby(sp[mask]).mean()
+                for p in range(1, 49):
+                    by_sp[(is_wknd, p)] = level * float(grp.get(p, 1.0))
+            shapes[label] = by_sp
+            src = "forward view" if fwd_level is not None else "trailing mean"
+            print(f"    level £{level:.2f}/MWh ({src}), "
+                  f"{IC_SHAPE_DAYS}d shape, {len(hh)} half-hours")
+        except Exception as e:
+            # Scrub the token in case a lower layer put the URL in the message
+            msg = str(e).replace(token, "***")
+            print(f"    {label} failed ({msg}); "
+                  f"using flat £{IC_FALLBACK_PRICE[label]:.2f}/MWh")
+            shapes[label] = flat[label]
+    return shapes
 
 
 def fetch_neso(resource_id: str, limit: int = 5000) -> pd.DataFrame:
@@ -283,7 +440,7 @@ def load_forecasts() -> pd.DataFrame:
     # --- Interconnector availability (FOU2T14D) ---
     print("Fetching interconnector availability from Elexon FOU2T14D...")
     ic_cols = []
-    for cap_gw, price, label, fuel_codes in INTERCONNECTORS:
+    for cap_gw, price, label, fuel_codes, _ in INTERCONNECTORS:
         col = f"ic_{label.lower().replace(' ', '_')}"
         ic_cols.append(col)
         ic = fetch_fou2t14d(fuel_codes, start, end)
@@ -311,7 +468,14 @@ def gas_mc(efficiency, vom):
     return fuel + ets + cps + vom
 
 
-def build_stack():
+def build_stack(ic_prices: dict = None):
+    """
+    Merit order for one settlement period.
+
+    ic_prices maps interconnector label -> import price for this period. The
+    stack must be rebuilt per period because continental prices are shaped
+    across the day, which moves each link's position in the merit order.
+    """
     stack = [
         ("Wind",    None,                              0.00,          "renewable"),
         ("Solar",   None,                              0.50,          "renewable"),
@@ -319,8 +483,9 @@ def build_stack():
         ("Nuclear", None, NUCLEAR_VOM,  "nuclear"),  # capacity set per-SP from FOU2T14D
         ("Biomass", None, BIOMASS_VOM,  "biomass"),   # capacity set per-SP from FOU2T14D
     ]
-    for cap_gw, price, label, _ in INTERCONNECTORS:
-        stack.append((label, None, price, "import"))  # capacity per-SP from FOU2T14D
+    for cap_gw, price, label, _, _ in INTERCONNECTORS:
+        mc = (ic_prices or {}).get(label, IC_FALLBACK_PRICE[label])
+        stack.append((label, None, mc, "import"))  # capacity per-SP from FOU2T14D
     for i, (eff, cap_gw, vom) in enumerate(GAS_TRANCHES, 1):
         mc = gas_mc(eff, vom)
         label = f"CCGT T{i} ({eff:.0%})" if eff >= 0.42 else f"OCGT T{i} ({eff:.0%})"
@@ -356,14 +521,18 @@ def dispatch(demand_gw, stack, wind_gw, solar_gw,
     return marginal[0] if marginal else "Unserved", round(price, 2)
 
 
-def run_model(forecasts, stack):
+def run_model(forecasts, ic_shapes):
     records = []
     for (dt, sp), row in forecasts.iterrows():
         ts = datetime.combine(dt, datetime.min.time()) + timedelta(minutes=30*(sp-1))
         ic_avail = {
             label: row[f"ic_{label.lower().replace(' ', '_')}"]
-            for _, _, label, _ in INTERCONNECTORS
+            for _, _, label, _, _ in INTERCONNECTORS
         }
+        key = (dt.weekday() >= 5, int(sp))
+        ic_prices = {label: ic_shapes[label][key]
+                     for _, _, label, _, _ in INTERCONNECTORS}
+        stack = build_stack(ic_prices)
         plant, price = dispatch(
             row["demand_gw"], stack,
             row["wind_gw"], row["solar_gw"],
@@ -430,7 +599,7 @@ def fmt_cell(ws, row, col, value, font=None, fill_=None, number_format=None,
     return c
 
 
-def write_assumptions_sheet(wb, stack):
+def write_assumptions_sheet(wb, ic_shapes):
     ws = wb.create_sheet("Assumptions")
     ws.sheet_view.showGridLines = False
     ws.column_dimensions["A"].width = 35
@@ -502,9 +671,18 @@ def write_assumptions_sheet(wb, stack):
          "Availability per SP from Elexon FOU2T14D — CfD/RO supported, near-zero bid", "", False); r += 1
     row_(ws, r, "Hydro (NPSHYD+PS)", f"{HYDRO_AVG_GW} GW registered",
          "Availability per SP from Elexon FOU2T14D (NPSHYD + PS)", "", False); r += 1
-    for cap_gw, price, label, fuel_codes in INTERCONNECTORS:
-        row_(ws, r, label, f"{cap_gw} GW registered",
-             f"Import price: £{price}/MWh  |  FOU2T14D: {', '.join(fuel_codes)}", "", False); r += 1
+    for cap_gw, fwd_level, label, fuel_codes, eic in INTERCONNECTORS:
+        prices = list((ic_shapes or {}).get(label, {}).values())
+        if prices:
+            lvl  = sum(prices) / len(prices)
+            src  = "forward view" if fwd_level is not None else \
+                   f"{IC_SHAPE_DAYS}d ENTSO-E trailing mean"
+            note = (f"Import £{lvl:.2f}/MWh mean, "
+                    f"£{min(prices):.2f}–£{max(prices):.2f} shaped by SP  |  "
+                    f"{src}  |  {eic}")
+        else:
+            note = f"Import price: £{IC_FALLBACK_PRICE[label]:.2f}/MWh flat"
+        row_(ws, r, label, f"{cap_gw} GW registered", note, "", False); r += 1
 
     r += 1
     section(r, "Variable O&M"); r += 1
@@ -539,6 +717,11 @@ def write_assumptions_sheet(wb, stack):
          "NESO Data Portal", "2-14 days ahead half hourly (NATIONALDEMAND)", "", False); r += 1
     row_(ws, r, "Plant & interconnector availability",
          "Elexon FOU2T14D", "2-14 day ahead, daily outputUsable", "", False); r += 1
+    row_(ws, r, "Interconnector import prices",
+         "ENTSO-E Transparency", f"Day-ahead, trailing {IC_SHAPE_DAYS}d, "
+         "shaped by settlement period (weekday/weekend)", "", False); r += 1
+    row_(ws, r, "EUR/GBP", "ECB daily reference rate",
+         "Applied to all continental day-ahead prices", "", False); r += 1
 
 
 def write_results_sheet(wb, df):
@@ -801,7 +984,7 @@ def write_charts_sheet(wb, df, daily):
     ws.row_dimensions[1].height = 24
 
 
-def write_excel(df, stack, run_time):
+def write_excel(df, ic_shapes, run_time):
     fname = f"gb_power_model_{run_time.strftime('%Y%m%d_%H%M')}.xlsx"
 
     wb = Workbook()
@@ -809,7 +992,7 @@ def write_excel(df, stack, run_time):
     wb.remove(wb.active)
 
     print("Writing Assumptions sheet...")
-    write_assumptions_sheet(wb, stack)
+    write_assumptions_sheet(wb, ic_shapes)
 
     print("Writing Daily Summary sheet...")
     daily = write_daily_summary_sheet(wb, df)
@@ -847,10 +1030,13 @@ if __name__ == "__main__":
     # Pull data
     forecasts = load_forecasts()
 
-    # Build stack and run model
+    # Interconnector import prices (level x intraday shape, per SP)
+    print("\nBuilding interconnector price profiles from ENTSO-E...")
+    ic_shapes = build_ic_price_shapes()
+
+    # Run model — the stack is rebuilt per period as import prices are shaped
     print("\nRunning dispatch model...")
-    stack = build_stack()
-    df    = run_model(forecasts, stack)
+    df = run_model(forecasts, ic_shapes)
 
     # Print console summary
     print("\n=== Summary ===")
@@ -864,5 +1050,5 @@ if __name__ == "__main__":
 
     # Write Excel
     print("\nWriting Excel output...")
-    fname = write_excel(df, stack, run_time)
+    fname = write_excel(df, ic_shapes, run_time)
     print(f"\nDone. Open: {fname}")
