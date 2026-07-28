@@ -611,14 +611,14 @@ def gas_mc(efficiency, vom, gas_p_therm=None, ets_price=None):
     return fuel + ets + cps + vom
 
 
-def build_stack(ic_prices: dict = None, gas_p_therm=None, ets_price=None):
+def build_stack(gas_p_therm=None, ets_price=None):
     """
-    Merit order for one settlement period.
+    Domestic merit order for one settlement period.
 
-    ic_prices maps interconnector label -> import price for this period. The
-    stack must be rebuilt per period because continental prices are shaped
-    across the day, which moves each link's position in the merit order.
-    gas_p_therm and ets_price set the gas stack for the day.
+    Interconnectors are deliberately absent: they can supply or consume
+    depending on how the GB price lands against the continental price, so
+    dispatch() handles them on both sides. gas_p_therm and ets_price set the
+    gas stack for the day.
     """
     stack = [
         ("Wind",    None,                              0.00,          "renewable"),
@@ -627,9 +627,6 @@ def build_stack(ic_prices: dict = None, gas_p_therm=None, ets_price=None):
         ("Nuclear", None, NUCLEAR_VOM,  "nuclear"),  # capacity set per-SP from FOU2T14D
         ("Biomass", None, BIOMASS_VOM,  "biomass"),   # capacity set per-SP from FOU2T14D
     ]
-    for cap_gw, label, _, _ in INTERCONNECTORS:
-        mc = (ic_prices or {}).get(label, IC_FALLBACK_PRICE[label])
-        stack.append((label, None, mc, "import"))  # capacity per-SP from FOU2T14D
     for i, (eff, cap_gw, vom) in enumerate(GAS_TRANCHES, 1):
         mc = gas_mc(eff, vom, gas_p_therm, ets_price)
         label = f"CCGT T{i} ({eff:.0%})" if eff >= 0.42 else f"OCGT T{i} ({eff:.0%})"
@@ -642,7 +639,33 @@ def build_stack(ic_prices: dict = None, gas_p_therm=None, ets_price=None):
 # ===========================================================================
 
 def dispatch(demand_gw, stack, wind_gw, solar_gw,
-             hydro_gw, nuclear_gw, biomass_gw, ic_avail: dict):
+             hydro_gw, nuclear_gw, biomass_gw, links):
+    """
+    Clear one settlement period against the domestic stack and the links.
+
+    links is [(label, available_gw, continental_price)]. A link is not a
+    generator: power flows toward the dearer market, so at a candidate GB
+    price p a link supplies GB when its continental price is at or below p
+    (import) and consumes from GB when it is above p (export). Treating them
+    as supply only, as this model used to, silently forces net imports and
+    removes the export demand that lifts the GB price at peak.
+
+    That makes the clearing price a fixed point — exports raise the GB price,
+    and the GB price decides whether a link exports — so solve it directly.
+    Supply is non-decreasing in p and demand is non-increasing (a link leaving
+    export moves cap_i off demand and onto supply), so supply - demand crosses
+    zero exactly once. Walk the candidate prices, which are the distinct
+    domestic marginal costs plus the continental prices, and take the first
+    that clears.
+
+    The continental market is a price taker: flow does not move its price, so
+    a link runs at full capacity whenever the two prices differ, and only sits
+    partly loaded when it is itself marginal — which is the coupled case where
+    the GB price has converged onto that link's price.
+
+    Returns (marginal_plant, price, net_import_gw), net_import negative when
+    GB is exporting on balance.
+    """
     period_output = {
         "Wind":    wind_gw,
         "Solar":   solar_gw,
@@ -650,19 +673,59 @@ def dispatch(demand_gw, stack, wind_gw, solar_gw,
         "Nuclear": nuclear_gw,
         "Biomass": biomass_gw,
     }
-    period_output.update(ic_avail)  # per-SP interconnector availability
-    remaining = demand_gw
-    marginal  = None
+    units = []
     for name, cap, mc, ptype in stack:
-        if remaining <= 0:
-            break
         avail = period_output.get(name, cap)
-        gen   = min(avail, remaining)
-        if gen > 0:
-            remaining -= gen
-            marginal   = (name, ptype, mc)
-    price = marginal[2] if marginal else 0.0
-    return marginal[0] if marginal else "Unserved", round(price, 2)
+        if avail is not None and avail > 0:
+            units.append((name, float(avail), mc, ptype))
+
+    def supply_at(p):
+        return (sum(c for _, c, mc, _ in units if mc <= p)
+                + sum(c for _, c, pc in links if pc <= p))
+
+    def demand_at(p):
+        return demand_gw + sum(c for _, c, pc in links if pc > p)
+
+    candidates = sorted({mc for _, _, mc, _ in units} | {pc for _, _, pc in links})
+    clearing = None
+    for p in candidates:
+        if supply_at(p) >= demand_at(p) - 1e-9:
+            clearing = p
+            break
+    if clearing is None:
+        # Even everything available cannot meet demand plus committed exports
+        return "Unserved", 0.0, 0.0
+
+    # Units priced exactly at the clearing price share whatever is left after
+    # everything strictly cheaper has run; whichever takes the last MW is
+    # marginal and sets the price.
+    below = (sum(c for _, c, mc, _ in units if mc < clearing)
+             + sum(c for _, c, pc in links if pc < clearing))
+    residual = demand_at(clearing) - below
+    at_price = ([(n, c, "unit") for n, c, mc, _ in units if mc == clearing]
+                + [(n, c, "link") for n, c, pc in links if pc == clearing])
+
+    marginal_name = None
+    marginal_link_import = 0.0
+    rem = residual
+    for name, cap, kind in at_price:
+        if rem <= 1e-9:
+            break
+        take = min(cap, rem)
+        rem -= take
+        marginal_name = name
+        if kind == "link":
+            marginal_link_import += take
+    if marginal_name is None:
+        # Nothing at the clearing price was needed: the last unit strictly
+        # below it is marginal.
+        cheaper = [(n, mc) for n, c, mc, _ in units if mc < clearing]
+        marginal_name = cheaper[-1][0] if cheaper else "Unserved"
+
+    imports = (sum(c for _, c, pc in links if pc < clearing)
+               + marginal_link_import)
+    exports = sum(c for _, c, pc in links if pc > clearing)
+    return marginal_name, round(clearing, 2), round(imports - exports, 3)
 
 
 def run_model(forecasts, ic_shapes, gas_curve, ets_price):
@@ -675,14 +738,15 @@ def run_model(forecasts, ic_shapes, gas_curve, ets_price):
             for _, label, _, _ in INTERCONNECTORS
         }
         key = (dt.weekday() >= 5, int(sp))
-        ic_prices = {label: ic_shapes[label][key]
-                     for _, label, _, _ in INTERCONNECTORS}
-        stack = build_stack(ic_prices, gas_today, ets_price)
-        plant, price = dispatch(
+        links = [(label, float(ic_avail[label]), ic_shapes[label][key])
+                 for _, label, _, _ in INTERCONNECTORS
+                 if ic_avail[label] and ic_avail[label] > 0]
+        stack = build_stack(gas_today, ets_price)
+        plant, price, net_ic = dispatch(
             row["demand_gw"], stack,
             row["wind_gw"], row["solar_gw"],
             row["hydro_gw"], row["nuclear_gw"], row["biomass_gw"],
-            ic_avail,
+            links,
         )
         records.append({
             "Datetime":          ts,
@@ -695,6 +759,7 @@ def run_model(forecasts, ic_shapes, gas_curve, ets_price):
             "Nuclear (GW)":      round(row["nuclear_gw"], 2),
             "Biomass (GW)":      round(row["biomass_gw"], 2),
             "Gas (p/therm)":     round(gas_today, 2),
+            "Net IC (GW)":       net_ic,   # +ve import, -ve export
             "Marginal Plant":    plant,
             "Price (£/MWh)":     price,
         })
@@ -888,8 +953,9 @@ def write_results_sheet(wb, df):
 
     cols = ["Datetime", "Date", "Settlement Period", "Demand (GW)",
             "Wind (GW)", "Solar (GW)", "Hydro (GW)", "Nuclear (GW)",
-            "Biomass (GW)", "Marginal Plant", "Price (£/MWh)"]
-    widths = [20, 12, 8, 12, 10, 10, 10, 11, 12, 22, 14]
+            "Biomass (GW)", "Net IC (GW)", "Marginal Plant", "Price (£/MWh)"]
+    widths = [20, 12, 8, 12, 10, 10, 10, 11, 12, 12, 22, 14]
+    price_col = len(cols)
 
     for i, (col, w) in enumerate(zip(cols, widths), 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -952,11 +1018,12 @@ def write_results_sheet(wb, df):
             row["Hydro (GW)"],
             row["Nuclear (GW)"],
             row["Biomass (GW)"],
+            row["Net IC (GW)"],
             plant,
             row["Price (£/MWh)"],
         ]
         fmts = [None, None, "0", "0.00", "0.00", "0.00", "0.00", "0.00",
-                "0.00", None, "£#,##0.00"]
+                "0.00", "+0.00;-0.00;0.00", None, "£#,##0.00"]
 
         for c_idx, (val, fmt) in enumerate(zip(values, fmts), 1):
             c = ws.cell(row=r_idx, column=c_idx, value=val)
@@ -969,7 +1036,7 @@ def write_results_sheet(wb, df):
                 c.number_format = fmt
 
         # Colour price cell by marginal plant
-        pc_cell = ws.cell(row=r_idx, column=11)
+        pc_cell = ws.cell(row=r_idx, column=price_col)
         pc_cell.fill = fill(pc)
         pc_cell.font = Font(name="Arial", size=9, bold=True, color=WHITE)
 
@@ -989,6 +1056,7 @@ def write_daily_summary_sheet(wb, df):
         Avg_Nuclear = ("Nuclear (GW)",  "mean"),
         Avg_Biomass = ("Biomass (GW)",  "mean"),
         Gas_P_Therm = ("Gas (p/therm)", "mean"),
+        Net_IC      = ("Net IC (GW)",   "mean"),
     ).reset_index()
     daily["Price_Range"] = daily["Max_Price"] - daily["Min_Price"]
     _peak = df.loc[df.groupby("Date")["Price (£/MWh)"].idxmax(),
@@ -996,11 +1064,11 @@ def write_daily_summary_sheet(wb, df):
     daily["Peak_Period"] = daily["Date"].map(_peak["Settlement Period"])
 
     ws.column_dimensions["A"].width = 14
-    for col, w in zip("BCDEFGHIJ", [12,10,10,12,11,11,12,12,11]):
+    for col, w in zip("BCDEFGHIJK", [12,10,10,12,11,11,12,12,11,11]):
         ws.column_dimensions[col].width = w
 
     # Title
-    ws.merge_cells("A1:J1")
+    ws.merge_cells("A1:K1")
     c = ws["A1"]
     c.value = "GB Power Market Model — Daily Summary"
     c.font  = Font(name="Arial", bold=True, size=12, color=WHITE)
@@ -1011,7 +1079,7 @@ def write_daily_summary_sheet(wb, df):
     headers = ["Date", "Avg Price\n(£/MWh)", "Min Price\n(£/MWh)",
                "Max Price\n(£/MWh)", "Price Range\n(£/MWh)",
                "Avg Demand\n(GW)", "Avg Wind\n(GW)", "Avg Solar\n(GW)",
-               "Peak SP", "NBP\n(p/therm)"]
+               "Peak SP", "NBP\n(p/therm)", "Net IC\n(GW)"]
     for i, h in enumerate(headers, 1):
         c = ws.cell(row=2, column=i, value=h)
         c.font      = Font(name="Arial", bold=True, size=10, color=WHITE)
@@ -1025,9 +1093,10 @@ def write_daily_summary_sheet(wb, df):
         row_fill = WHITE if r_idx % 2 == 1 else PALE_BLUE
         vals = [str(row.Date), row.Avg_Price, row.Min_Price, row.Max_Price,
                 row.Price_Range, row.Avg_Demand, row.Avg_Wind,
-                row.Avg_Solar, row.Peak_Period, row.Gas_P_Therm]
+                row.Avg_Solar, row.Peak_Period, row.Gas_P_Therm, row.Net_IC]
         fmts = [None, "£#,##0.00","£#,##0.00","£#,##0.00",
-                "£#,##0.00","0.0","0.0","0.0","0","0.00"]
+                "£#,##0.00","0.0","0.0","0.0","0","0.00",
+                "+0.00;-0.00;0.00"]
         for c_idx, (v, f) in enumerate(zip(vals, fmts), 1):
             c = ws.cell(row=r_idx, column=c_idx, value=v)
             c.font   = cell_font(size=10)
