@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Copy to forward_levels.json and fill in. That filename is gitignored,",
+    "so licensed forward assessments stay out of this public repository.",
+    "",
+    "Use the BASELOAD forward for the forecast window, not peak: the model",
+    "applies an intraday shape from ENTSO-E on top of this level, so a peak",
+    "assessment would count the daily shape twice.",
+    "",
+    "currency: EUR or GBP. EUR is converted at the ECB daily reference rate.",
+    "Omit a link, or set it to null, to use the trailing ENTSO-E mean instead.",
+    "",
+    "The values below are placeholders, not assessments."
+  ],
+  "currency": "EUR",
+  "levels": {
+    "Interconnector NO": null,
+    "Interconnector DK": null,
+    "Interconnector FR": 95.00,
+    "Interconnector BE": 110.00,
+    "Interconnector NL": 107.00,
+    "Interconnector IE": 152.00
+  }
+}

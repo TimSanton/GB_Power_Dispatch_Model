@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 gb_power_model_*.xlsx
+
+# Licensed forward price assessments — never commit
+forward_levels.json
