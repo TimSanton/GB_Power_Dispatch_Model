@@ -99,19 +99,30 @@ INTERCONNECTORS = [
     (1.3, "Interconnector IE", ["INTIRL", "INTEW", "INTGRNL"], "10Y1001A1001A59C"),  # Moyle 0.4 + EWIC 0.5 + Greenlink 0.5 GW (SEM)
 ]
 
-# Forward price levels for the forecast window, one baseload price per link.
+# Forward price inputs for the forecast window, read at run time from
+# FORWARD_LEVELS_FILE. It carries three things:
+#
+#   levels           — one BASELOAD price per interconnector link. Not peak:
+#                      the intraday shape is applied on top of this level, so a
+#                      peak assessment would count the daily shape twice.
+#                      Quoted in "currency" (EUR default, converted at the ECB
+#                      rate). Links omitted or null fall back to the trailing
+#                      ENTSO-E realised mean.
+#   nbp_p_therm      — NBP gas, p/therm. Either one number for the window or a
+#                      {date: price} curve; a curve is preferred because NBP
+#                      moves day to day and gas sets the GB price in most
+#                      periods. Always GBP, never converted.
+#   uk_ets_gbp_tonne — UKA carbon, £/tonne. One number: carbon is an annual
+#                      compliance instrument with no meaningful shape.
+#
+# Neither gas nor carbon takes an intraday shape. A gas day is a single
+# product, so a plant's fuel cost is flat across all 48 settlement periods,
+# and carbon has no intraday dimension at all.
 #
 # Argus (and any other) forward assessments are LICENSED DATA. This repository
-# is public, so those numbers must not be committed to it. Levels are read at
-# run time from FORWARD_LEVELS_FILE, which is gitignored — see
-# forward_levels.example.json for the format. Links with no level fall back to
-# the trailing ENTSO-E realised mean.
-#
-# Use the BASELOAD assessment, not peak: the intraday shape is applied on top
-# of this level, so a peak forward would count the daily shape twice.
-#
-# Continental power forwards are quoted in EUR/MWh; set "currency" to "GBP" in
-# the file if you are entering sterling. EUR is converted at the ECB rate.
+# is public, so those numbers must not be committed to it — the file is
+# gitignored. See forward_levels.example.json for the format. Anything absent
+# falls back to the hardcoded assumptions above.
 FORWARD_LEVELS_FILE    = "forward_levels.json"
 # Fallback import prices (£/MWh) used only when ENTSO-E is unavailable — flat,
 # and therefore a poor approximation of a shaped continental price.
@@ -232,43 +243,97 @@ def fetch_entsoe_da_prices(eic: str, start: date, end: date,
     return s[~s.index.duplicated(keep="last")]
 
 
-def load_forward_levels(fx: float) -> dict:
+def load_forward_inputs(fx: float) -> dict:
     """
-    Read forward baseload levels from FORWARD_LEVELS_FILE, returning
-    {label: level_gbp_mwh} for whichever links are present.
+    Read forward assessments from FORWARD_LEVELS_FILE.
 
-    The file is gitignored so licensed forward assessments stay out of this
-    public repository. Missing or malformed files are not fatal — the caller
-    falls back to the trailing realised mean.
+    Returns {"ic_levels": {label: gbp_mwh},
+             "nbp":       pd.Series indexed by date (p/therm) or None,
+             "ets":       float or None}
+
+    The file is gitignored so licensed assessments stay out of this public
+    repository. A missing or malformed file is not fatal — every caller falls
+    back to the hardcoded assumptions.
     """
+    empty = {"ic_levels": {}, "nbp": None, "ets": None}
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         FORWARD_LEVELS_FILE)
     if not os.path.exists(path):
-        print(f"  No {FORWARD_LEVELS_FILE} — levels from trailing ENTSO-E mean")
-        return {}
+        print(f"  No {FORWARD_LEVELS_FILE} — using hardcoded gas/carbon and "
+              f"trailing ENTSO-E interconnector levels")
+        return empty
     try:
         with open(path) as fh:
             blob = json.load(fh)
-        ccy    = str(blob.get("currency", "EUR")).upper()
-        levels = blob.get("levels", {})
+        ccy = str(blob.get("currency", "EUR")).upper()
         if ccy not in ("EUR", "GBP"):
             raise ValueError(f"currency must be EUR or GBP, got {ccy!r}")
-        known = {label for _, label, _, _ in INTERCONNECTORS}
+
+        # --- interconnector baseload levels ---
+        levels  = blob.get("levels") or {}
+        known   = {label for _, label, _, _ in INTERCONNECTORS}
         unknown = set(levels) - known
         if unknown:
-            print(f"  {FORWARD_LEVELS_FILE}: ignoring unknown links {sorted(unknown)}")
+            print(f"  {FORWARD_LEVELS_FILE}: ignoring unknown links "
+                  f"{sorted(unknown)}")
         rate = fx if ccy == "EUR" else 1.0
-        out = {k: float(v) * rate for k, v in levels.items()
-               if k in known and v is not None}
-        print(f"  {FORWARD_LEVELS_FILE}: {len(out)} forward level(s) in {ccy}")
-        return out
+        ic_levels = {k: float(v) * rate for k, v in levels.items()
+                     if k in known and v is not None}
+
+        # --- NBP: a scalar or a {date: p/therm} curve. Always GBP. ---
+        nbp_raw = blob.get("nbp_p_therm")
+        nbp = None
+        if isinstance(nbp_raw, dict) and nbp_raw:
+            nbp = pd.Series({pd.to_datetime(k).date(): float(v)
+                             for k, v in nbp_raw.items() if v is not None})
+            nbp = nbp.sort_index()
+        elif isinstance(nbp_raw, (int, float)):
+            nbp = float(nbp_raw)
+
+        ets = blob.get("uk_ets_gbp_tonne")
+        ets = float(ets) if isinstance(ets, (int, float)) else None
+
+        bits = [f"{len(ic_levels)} link level(s) in {ccy}"]
+        if isinstance(nbp, pd.Series):
+            bits.append(f"NBP curve {len(nbp)}d "
+                        f"{nbp.min():.1f}-{nbp.max():.1f} p/therm")
+        elif nbp is not None:
+            bits.append(f"NBP flat {nbp:.1f} p/therm")
+        if ets is not None:
+            bits.append(f"UK ETS £{ets:.2f}/t")
+        print(f"  {FORWARD_LEVELS_FILE}: " + ", ".join(bits))
+        return {"ic_levels": ic_levels, "nbp": nbp, "ets": ets}
     except Exception as e:
         print(f"  {FORWARD_LEVELS_FILE} unreadable ({e}); "
-              f"falling back to trailing ENTSO-E mean")
-        return {}
+              f"falling back to hardcoded assumptions")
+        return empty
 
 
-def build_ic_price_shapes() -> dict:
+def resolve_gas_curve(nbp, model_dates) -> pd.Series:
+    """
+    A p/therm price for every modelled date.
+
+    Accepts a scalar, a {date: price} Series, or None. A curve is reindexed
+    onto the modelled dates and filled forward then backward, so a curve that
+    is short at either end holds its nearest price rather than snapping back
+    to the static assumption mid-window.
+    """
+    dates = sorted(set(model_dates))
+    if isinstance(nbp, pd.Series) and not nbp.empty:
+        s = nbp.reindex(dates)
+        missing = int(s.isna().sum())
+        s = s.ffill().bfill()
+        if s.isna().any():
+            s = s.fillna(GAS_PRICE_P_THERM)
+        if missing:
+            print(f"  NBP curve missing {missing}/{len(dates)} modelled "
+                  f"date(s) — filled from nearest quoted day")
+        return s
+    level = nbp if isinstance(nbp, (int, float)) else GAS_PRICE_P_THERM
+    return pd.Series(level, index=dates)
+
+
+def build_ic_price_shapes(fx: float, forward: dict) -> dict:
     """
     Build an import price for every interconnector and settlement period.
 
@@ -288,8 +353,6 @@ def build_ic_price_shapes() -> dict:
         print(f"  {ENTSOE_TOKEN_ENV} not set — using flat fallback import prices")
         return flat, {lab: "flat fallback" for lab in flat}
 
-    fx      = fetch_eur_gbp()
-    forward = load_forward_levels(fx)
     end     = date.today()
     start   = end - timedelta(days=IC_SHAPE_DAYS)
     shapes, sources = {}, {}
@@ -518,21 +581,32 @@ def load_forecasts() -> pd.DataFrame:
 # MARGINAL COST & MERIT ORDER
 # ===========================================================================
 
-def gas_mc(efficiency, vom):
-    gbp_per_mwh_th = (GAS_PRICE_P_THERM / 100) / 0.02931
+def gas_mc(efficiency, vom, gas_p_therm=None, ets_price=None):
+    """
+    Short run marginal cost of a gas tranche, £/MWh.
+
+    gas_p_therm and ets_price default to the hardcoded assumptions; the model
+    passes the day's forward values when forward_levels.json supplies them.
+    Both are flat within a day — a gas day is one product and carbon has no
+    intraday dimension — so this is constant across settlement periods.
+    """
+    gas = GAS_PRICE_P_THERM    if gas_p_therm is None else gas_p_therm
+    ets_p = ETS_PRICE_GBP_TONNE if ets_price   is None else ets_price
+    gbp_per_mwh_th = (gas / 100) / 0.02931
     fuel   = gbp_per_mwh_th / efficiency
-    ets    = (ETS_EMISSIONS / efficiency) * ETS_PRICE_GBP_TONNE
+    ets    = (ETS_EMISSIONS / efficiency) * ets_p
     cps    = (CPS_EMISSIONS / efficiency) * CPS_RATE_GBP_TONNE
     return fuel + ets + cps + vom
 
 
-def build_stack(ic_prices: dict = None):
+def build_stack(ic_prices: dict = None, gas_p_therm=None, ets_price=None):
     """
     Merit order for one settlement period.
 
     ic_prices maps interconnector label -> import price for this period. The
     stack must be rebuilt per period because continental prices are shaped
     across the day, which moves each link's position in the merit order.
+    gas_p_therm and ets_price set the gas stack for the day.
     """
     stack = [
         ("Wind",    None,                              0.00,          "renewable"),
@@ -545,7 +619,7 @@ def build_stack(ic_prices: dict = None):
         mc = (ic_prices or {}).get(label, IC_FALLBACK_PRICE[label])
         stack.append((label, None, mc, "import"))  # capacity per-SP from FOU2T14D
     for i, (eff, cap_gw, vom) in enumerate(GAS_TRANCHES, 1):
-        mc = gas_mc(eff, vom)
+        mc = gas_mc(eff, vom, gas_p_therm, ets_price)
         label = f"CCGT T{i} ({eff:.0%})" if eff >= 0.42 else f"OCGT T{i} ({eff:.0%})"
         stack.append((label, cap_gw, mc, "gas"))
     return sorted(stack, key=lambda x: x[2])
@@ -579,9 +653,10 @@ def dispatch(demand_gw, stack, wind_gw, solar_gw,
     return marginal[0] if marginal else "Unserved", round(price, 2)
 
 
-def run_model(forecasts, ic_shapes):
+def run_model(forecasts, ic_shapes, gas_curve, ets_price):
     records = []
     for (dt, sp), row in forecasts.iterrows():
+        gas_today = float(gas_curve.get(dt, GAS_PRICE_P_THERM))
         ts = datetime.combine(dt, datetime.min.time()) + timedelta(minutes=30*(sp-1))
         ic_avail = {
             label: row[f"ic_{label.lower().replace(' ', '_')}"]
@@ -590,7 +665,7 @@ def run_model(forecasts, ic_shapes):
         key = (dt.weekday() >= 5, int(sp))
         ic_prices = {label: ic_shapes[label][key]
                      for _, label, _, _ in INTERCONNECTORS}
-        stack = build_stack(ic_prices)
+        stack = build_stack(ic_prices, gas_today, ets_price)
         plant, price = dispatch(
             row["demand_gw"], stack,
             row["wind_gw"], row["solar_gw"],
@@ -607,6 +682,7 @@ def run_model(forecasts, ic_shapes):
             "Hydro (GW)":        round(row["hydro_gw"],   2),
             "Nuclear (GW)":      round(row["nuclear_gw"], 2),
             "Biomass (GW)":      round(row["biomass_gw"], 2),
+            "Gas (p/therm)":     round(gas_today, 2),
             "Marginal Plant":    plant,
             "Price (£/MWh)":     price,
         })
@@ -657,7 +733,7 @@ def fmt_cell(ws, row, col, value, font=None, fill_=None, number_format=None,
     return c
 
 
-def write_assumptions_sheet(wb, ic_shapes, ic_level_source):
+def write_assumptions_sheet(wb, ic_shapes, ic_level_source, gas_curve, ets_price):
     ws = wb.create_sheet("Assumptions")
     ws.sheet_view.showGridLines = False
     ws.column_dimensions["A"].width = 35
@@ -696,8 +772,19 @@ def write_assumptions_sheet(wb, ic_shapes, ic_level_source):
 
     r = 3
     section(r, "Gas & Carbon Prices"); r += 1
-    row_(ws, r, "Gas price",              GAS_PRICE_P_THERM,   "p/therm (NBP)"); r += 1
-    row_(ws, r, "UK ETS carbon price",    ETS_PRICE_GBP_TONNE, "£/tonne CO2"); r += 1
+    _g = gas_curve if gas_curve is not None else pd.Series(dtype=float)
+    if len(_g) and _g.nunique() > 1:
+        row_(ws, r, "Gas price (NBP)", f"{_g.mean():.2f} avg",
+             f"p/therm  |  daily curve {_g.min():.2f}-{_g.max():.2f} "
+             f"over {len(_g)} days, from {FORWARD_LEVELS_FILE}"); r += 1
+    else:
+        _lvl = float(_g.iloc[0]) if len(_g) else GAS_PRICE_P_THERM
+        _src = (f"from {FORWARD_LEVELS_FILE}" if _lvl != GAS_PRICE_P_THERM
+                else "hardcoded assumption")
+        row_(ws, r, "Gas price (NBP)", _lvl, f"p/therm  |  flat, {_src}"); r += 1
+    row_(ws, r, "UK ETS carbon price", ets_price,
+         "£/tonne CO2  |  no intraday or daily shape — annual compliance "
+         "instrument"); r += 1
     row_(ws, r, "Carbon Price Support",   CPS_RATE_GBP_TONNE,  "£/tonne CO2  |  Frozen at £18 since April 2016"); r += 1
 
     r += 1
@@ -711,10 +798,11 @@ def write_assumptions_sheet(wb, ic_shapes, ic_level_source):
 
     r += 1
     section(r, f"Gas Fleet — {len(GAS_TRANCHES)} Efficiency Tranches"); r += 1
+    _gas_avg = float(_g.mean()) if len(_g) else GAS_PRICE_P_THERM
     row_(ws, r, "Source", "NESO 2026/27 Final ALF data, Argus efficiency bands",
-         "", "", False); r += 1
+         f"SRMC shown at the window-average {_gas_avg:.2f} p/therm", "", False); r += 1
     for i, (eff, cap, vom) in enumerate(GAS_TRANCHES, 1):
-        mc   = gas_mc(eff, vom)
+        mc   = gas_mc(eff, vom, _gas_avg, ets_price)
         kind = "CCGT" if eff >= 0.42 else "OCGT"
         row_(ws, r,
              f"  T{i} — {kind} {eff:.0%} efficiency",
@@ -888,6 +976,7 @@ def write_daily_summary_sheet(wb, df):
         Avg_Hydro   = ("Hydro (GW)",    "mean"),
         Avg_Nuclear = ("Nuclear (GW)",  "mean"),
         Avg_Biomass = ("Biomass (GW)",  "mean"),
+        Gas_P_Therm = ("Gas (p/therm)", "mean"),
     ).reset_index()
     daily["Price_Range"] = daily["Max_Price"] - daily["Min_Price"]
     _peak = df.loc[df.groupby("Date")["Price (£/MWh)"].idxmax(),
@@ -895,11 +984,11 @@ def write_daily_summary_sheet(wb, df):
     daily["Peak_Period"] = daily["Date"].map(_peak["Settlement Period"])
 
     ws.column_dimensions["A"].width = 14
-    for col, w in zip("BCDEFGHI", [12,10,10,12,11,11,12,12]):
+    for col, w in zip("BCDEFGHIJ", [12,10,10,12,11,11,12,12,11]):
         ws.column_dimensions[col].width = w
 
     # Title
-    ws.merge_cells("A1:I1")
+    ws.merge_cells("A1:J1")
     c = ws["A1"]
     c.value = "GB Power Market Model — Daily Summary"
     c.font  = Font(name="Arial", bold=True, size=12, color=WHITE)
@@ -910,7 +999,7 @@ def write_daily_summary_sheet(wb, df):
     headers = ["Date", "Avg Price\n(£/MWh)", "Min Price\n(£/MWh)",
                "Max Price\n(£/MWh)", "Price Range\n(£/MWh)",
                "Avg Demand\n(GW)", "Avg Wind\n(GW)", "Avg Solar\n(GW)",
-               "Peak SP"]
+               "Peak SP", "NBP\n(p/therm)"]
     for i, h in enumerate(headers, 1):
         c = ws.cell(row=2, column=i, value=h)
         c.font      = Font(name="Arial", bold=True, size=10, color=WHITE)
@@ -924,9 +1013,9 @@ def write_daily_summary_sheet(wb, df):
         row_fill = WHITE if r_idx % 2 == 1 else PALE_BLUE
         vals = [str(row.Date), row.Avg_Price, row.Min_Price, row.Max_Price,
                 row.Price_Range, row.Avg_Demand, row.Avg_Wind,
-                row.Avg_Solar, row.Peak_Period]
+                row.Avg_Solar, row.Peak_Period, row.Gas_P_Therm]
         fmts = [None, "£#,##0.00","£#,##0.00","£#,##0.00",
-                "£#,##0.00","0.0","0.0","0.0","0"]
+                "£#,##0.00","0.0","0.0","0.0","0","0.00"]
         for c_idx, (v, f) in enumerate(zip(vals, fmts), 1):
             c = ws.cell(row=r_idx, column=c_idx, value=v)
             c.font   = cell_font(size=10)
@@ -1041,7 +1130,7 @@ def write_charts_sheet(wb, df, daily):
     ws.row_dimensions[1].height = 24
 
 
-def write_excel(df, ic_shapes, ic_level_source, run_time):
+def write_excel(df, ic_shapes, ic_level_source, gas_curve, ets_price, run_time):
     fname = f"gb_power_model_{run_time.strftime('%Y%m%d_%H%M')}.xlsx"
 
     wb = Workbook()
@@ -1049,7 +1138,7 @@ def write_excel(df, ic_shapes, ic_level_source, run_time):
     wb.remove(wb.active)
 
     print("Writing Assumptions sheet...")
-    write_assumptions_sheet(wb, ic_shapes, ic_level_source)
+    write_assumptions_sheet(wb, ic_shapes, ic_level_source, gas_curve, ets_price)
 
     print("Writing Daily Summary sheet...")
     daily = write_daily_summary_sheet(wb, df)
@@ -1087,13 +1176,24 @@ if __name__ == "__main__":
     # Pull data
     forecasts = load_forecasts()
 
-    # Interconnector import prices (level x intraday shape, per SP)
+    # Forward assessments (gitignored file) then interconnector price profiles
+    print("\nLoading forward price inputs...")
+    fx      = fetch_eur_gbp()
+    forward = load_forward_inputs(fx)
+
     print("\nBuilding interconnector price profiles from ENTSO-E...")
-    ic_shapes, ic_level_source = build_ic_price_shapes()
+    ic_shapes, ic_level_source = build_ic_price_shapes(fx, forward["ic_levels"])
+
+    gas_curve = resolve_gas_curve(
+        forward["nbp"], forecasts.index.get_level_values("date"))
+    ets_price = forward["ets"] if forward["ets"] is not None \
+        else ETS_PRICE_GBP_TONNE
+    print(f"  Gas: {gas_curve.min():.2f}-{gas_curve.max():.2f} p/therm "
+          f"across {len(gas_curve)} days   |   UK ETS: £{ets_price:.2f}/tonne")
 
     # Run model — the stack is rebuilt per period as import prices are shaped
     print("\nRunning dispatch model...")
-    df = run_model(forecasts, ic_shapes)
+    df = run_model(forecasts, ic_shapes, gas_curve, ets_price)
 
     # Print console summary
     print("\n=== Summary ===")
@@ -1107,5 +1207,6 @@ if __name__ == "__main__":
 
     # Write Excel
     print("\nWriting Excel output...")
-    fname = write_excel(df, ic_shapes, ic_level_source, run_time)
+    fname = write_excel(df, ic_shapes, ic_level_source,
+                        gas_curve, ets_price, run_time)
     print(f"\nDone. Open: {fname}")

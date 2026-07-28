@@ -1,16 +1,32 @@
 {
   "_comment": [
-    "Copy to forward_levels.json and fill in. That filename is gitignored,",
-    "so licensed forward assessments stay out of this public repository.",
+    "Copy to forward_levels.json and fill in. That filename is gitignored, so",
+    "licensed forward assessments stay out of this public repository.",
+    "Anything you omit falls back to the hardcoded assumptions in run_model.py.",
     "",
-    "Use the BASELOAD forward for the forecast window, not peak: the model",
-    "applies an intraday shape from ENTSO-E on top of this level, so a peak",
-    "assessment would count the daily shape twice.",
+    "currency  — applies to the interconnector levels only. EUR (default) is",
+    "            converted at the ECB daily reference rate; GBP is used as-is.",
+    "            NBP and UK ETS are always GBP.",
     "",
-    "currency: EUR or GBP. EUR is converted at the ECB daily reference rate.",
-    "Omit a link, or set it to null, to use the trailing ENTSO-E mean instead.",
+    "levels    — BASELOAD forward per link for the forecast window, not peak:",
+    "            the model applies an intraday shape from ENTSO-E on top, so a",
+    "            peak assessment would count the daily shape twice. Omit a link",
+    "            or set null to use the trailing ENTSO-E realised mean instead.",
     "",
-    "The values below are placeholders, not assessments."
+    "nbp_p_therm — either a single number for the whole window, or the daily",
+    "            curve shown below. A curve is preferred: NBP moves day to day",
+    "            and gas sets the GB price in most periods, so this is the",
+    "            single most sensitive input in the model (about 0.62 GBP/MWh",
+    "            per p/therm at the marginal 55% tranche). Dates outside the",
+    "            modelled window are ignored; gaps inside it hold the nearest",
+    "            quoted day. No intraday shape: a gas day is one product, so a",
+    "            plant's fuel cost is flat across all 48 settlement periods.",
+    "",
+    "uk_ets_gbp_tonne — one number. Carbon is an annual compliance instrument,",
+    "            so it takes neither an intraday nor a daily shape. CPS is a",
+    "            frozen statutory rate and stays in run_model.py.",
+    "",
+    "All values below are placeholders, not assessments."
   ],
   "currency": "EUR",
   "levels": {
@@ -20,5 +36,11 @@
     "Interconnector BE": 110.00,
     "Interconnector NL": 107.00,
     "Interconnector IE": 152.00
-  }
+  },
+  "nbp_p_therm": {
+    "2026-01-01": 82.15,
+    "2026-01-02": 82.60,
+    "2026-01-03": 83.05
+  },
+  "uk_ets_gbp_tonne": 47.50
 }
