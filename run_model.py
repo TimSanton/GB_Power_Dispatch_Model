@@ -18,16 +18,15 @@ Output:
     gb_power_model_YYYYMMDD_HHMM.xlsx
 """
 
+import re
+
 import requests
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta, date
 from openpyxl import Workbook
-from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
-                              GradientFill)
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import LineChart, Reference
-from openpyxl.chart.series import SeriesLabel
 
 
 # ===========================================================================
@@ -109,8 +108,8 @@ MODEL_END_DAY          = 14
 # NESO Data Portal (CKAN datastore)
 NESO_API               = "https://api.neso.energy/api/3/action/datastore_search"
 DEMAND_2_14_RESOURCE   = "7c0411cd-2714-4bb5-a408-adb065edf34d"  # 2-14 day ahead demand
-WIND_14DA_RESOURCE     = "93c3048e-1dab-4057-a2a9-417540cf1f8a"  # 14 day ahead transmission wind
-EMBEDDED_RESOURCE      = "db6c6a8c-3ef0-4e08-ac89-1c3b32f962af"  # embedded wind + solar
+WIND_14DA_RESOURCE     = "93c3048e-1dab-4057-a2a9-417540583929"  # 14 day ahead transmission wind
+EMBEDDED_RESOURCE      = "db6c038f-98af-4570-ab60-24d71ebd0ae5"  # embedded wind + solar
 
 # Elexon Insights API
 ELEXON_API             = "https://data.elexon.co.uk/bmrs/api/v1"
@@ -166,7 +165,9 @@ def fetch_fou2t14d(fuel_types, start: date, end: date) -> pd.Series:
                 print(f"  FOU2T14D {fuel_type}: no data returned")
                 continue
             df = pd.DataFrame(data)
-            df["date"] = pd.to_datetime(df["settlementDate"]).dt.date
+            # The query params are settlementDateFrom/To, but the response
+            # dates the forecast with forecastDate.
+            df["date"] = pd.to_datetime(df["forecastDate"]).dt.date
             df["outputUsable_mw"] = pd.to_numeric(df["outputUsable"], errors="coerce")
             # Keep most recent publication per day
             df = (df.sort_values("publishTime")
@@ -199,7 +200,7 @@ def load_forecasts() -> pd.DataFrame:
     # --- Transmission wind ---
     wind_raw = fetch_neso(WIND_14DA_RESOURCE)
     wind_raw["date"] = pd.to_datetime(wind_raw["Date"]).dt.date
-    wind_raw["sp"]   = wind_raw["Settlement_period"].astype(int)
+    wind_raw["sp"]   = wind_raw["Settlement_Period"].astype(int)
     wind = wind_raw[
         (wind_raw["date"] >= start) & (wind_raw["date"] <= end)
     ][["date", "sp", "Wind_Forecast"]].copy()
@@ -216,24 +217,17 @@ def load_forecasts() -> pd.DataFrame:
     emb["EMBEDDED_SOLAR_FORECAST"] = pd.to_numeric(emb["EMBEDDED_SOLAR_FORECAST"])
 
     # --- 2-14 day demand ---
+    # This dataset has no settlement period column: it carries the local
+    # settlement date (DATE) plus a period-ending clock time (CTIME) as an
+    # HHMM integer — 30 (00:30, SP 1) through 2400 (24:00, SP 48).
     dem_raw = fetch_neso(DEMAND_2_14_RESOURCE)
-    # Identify date and SP columns (inspect first)
-    print(f"  Demand columns: {dem_raw.columns.tolist()[:8]}")
-    # Common column names in this dataset
-    date_col = next((c for c in dem_raw.columns
-                     if "date" in c.lower() and "time" not in c.lower()), None)
-    sp_col   = next((c for c in dem_raw.columns
-                     if "period" in c.lower() or "sp" in c.lower()), None)
-    nd_col   = next((c for c in dem_raw.columns
-                     if "demand" in c.lower() or "nd" in c.lower()), None)
-    print(f"  Demand: date={date_col}, sp={sp_col}, nd={nd_col}")
-    dem_raw["date"] = pd.to_datetime(dem_raw[date_col]).dt.date
-    dem_raw["sp"]   = dem_raw[sp_col].astype(int)
+    dem_raw["date"] = pd.to_datetime(dem_raw["DATE"]).dt.date
+    ctime = pd.to_numeric(dem_raw["CTIME"])
+    dem_raw["sp"] = (((ctime // 100) * 60 + (ctime % 100)) // 30).astype(int)
+    dem_raw["demand_mw"] = pd.to_numeric(dem_raw["NATIONALDEMAND"])
     dem = dem_raw[
         (dem_raw["date"] >= start) & (dem_raw["date"] <= end)
-    ][["date", "sp", nd_col]].copy()
-    dem[nd_col] = pd.to_numeric(dem[nd_col])
-    dem = dem.rename(columns={nd_col: "demand_mw"})
+    ][["date", "sp", "demand_mw"]].copy()
 
     # --- Merge ---
     df = wind.merge(emb,  on=["date", "sp"], how="inner")
@@ -255,6 +249,7 @@ def load_forecasts() -> pd.DataFrame:
         nuc_gw = nuc / 1000
         df["nuclear_gw"] = df.index.get_level_values("date").map(nuc_gw)
         # Fill any gaps with installed capacity
+        df["nuclear_gw"] = df["nuclear_gw"].fillna(NUCLEAR_GW)
     else:
         print(f"  Nuclear: using fixed {NUCLEAR_GW} GW (no FOU2T14D data)")
         df["nuclear_gw"] = NUCLEAR_GW
@@ -482,16 +477,16 @@ def write_assumptions_sheet(wb, stack):
          "BEIS GHG Conversion Factors 2025, natural gas gross CV, CO2 only", False); r += 1
 
     r += 1
-    section(r, "CCGT Fleet — 6 Efficiency Tranches"); r += 1
-    row_(ws, r, "Source", "NESO Jan 2026 Final Annual Load Factors (2026/27 TNUoS)",
+    section(r, f"Gas Fleet — {len(GAS_TRANCHES)} Efficiency Tranches"); r += 1
+    row_(ws, r, "Source", "NESO 2026/27 Final ALF data, Argus efficiency bands",
          "", "", False); r += 1
-    for i, (eff, cap) in enumerate(CCGT_TRANCHES, 1):
-        mc    = gas_mc(eff, CCGT_VOM)
-        price = mc + SYSTEM_COSTS
+    for i, (eff, cap, vom) in enumerate(GAS_TRANCHES, 1):
+        mc   = gas_mc(eff, vom)
+        kind = "CCGT" if eff >= 0.42 else "OCGT"
         row_(ws, r,
-             f"  T{i} — {eff:.0%} efficiency",
+             f"  T{i} — {kind} {eff:.0%} efficiency",
              f"{cap:.1f} GW",
-             f"MC: £{mc:.2f}/MWh   |   Price: £{price:.2f}/MWh", "", False); r += 1
+             f"SRMC: £{mc:.2f}/MWh   |   VOM: £{vom:.2f}/MWh", "", False); r += 1
 
     r += 1
     section(r, "Other Plant"); r += 1
@@ -504,13 +499,25 @@ def write_assumptions_sheet(wb, stack):
     for cap_gw, price, label, fuel_codes in INTERCONNECTORS:
         row_(ws, r, label, f"{cap_gw} GW registered",
              f"Import price: £{price}/MWh  |  FOU2T14D: {', '.join(fuel_codes)}", "", False); r += 1
-    row_(ws, r, "OCGT",          f"{OCGT_GW} GW",
-         f"{OCGT_EFFICIENCY:.0%} efficiency", "", False); r += 1
 
     r += 1
-    section(r, "System Costs"); r += 1
-    row_(ws, r, "System / balancing costs adder", SYSTEM_COSTS,
-         "£/MWh  |  Added to marginal plant cost"); r += 1
+    section(r, "Variable O&M"); r += 1
+    row_(ws, r, "Gas (CCGT & OCGT)", CCGT_VOM,
+         "£/MWh  |  DESNZ 2025 generation costs, all gas plant (2024 prices)"); r += 1
+    row_(ws, r, "Nuclear", NUCLEAR_VOM,
+         "£/MWh  |  ASSUMPTION — no published source, never sets the price"); r += 1
+    row_(ws, r, "Hydro", HYDRO_VOM,
+         "£/MWh  |  ASSUMPTION — no published source, never sets the price"); r += 1
+    row_(ws, r, "Biomass", BIOMASS_VOM,
+         "£/MWh  |  Near-zero bid due to CfD/RO support"); r += 1
+
+    r += 1
+    section(r, "Price Formation"); r += 1
+    row_(ws, r, "Output price", "SRMC of marginal plant",
+         "Wholesale market clearing price", "", False); r += 1
+    row_(ws, r, "System costs adder", "Not applied",
+         "BSUoS/TNUoS/DUoS are non-commodity charges recovered separately "
+         "and are not part of wholesale price formation", "", False); r += 1
 
     r += 1
     section(r, "Data Sources"); r += 1
@@ -528,8 +535,9 @@ def write_results_sheet(wb, df):
     ws.freeze_panes = "A3"
 
     cols = ["Datetime", "Date", "Settlement Period", "Demand (GW)",
-            "Wind (GW)", "Solar (GW)", "Marginal Plant", "Price (£/MWh)"]
-    widths = [20, 12, 8, 12, 10, 10, 22, 14]
+            "Wind (GW)", "Solar (GW)", "Hydro (GW)", "Nuclear (GW)",
+            "Biomass (GW)", "Marginal Plant", "Price (£/MWh)"]
+    widths = [20, 12, 8, 12, 10, 10, 10, 11, 12, 22, 14]
 
     for i, (col, w) in enumerate(zip(cols, widths), 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -565,19 +573,20 @@ def write_results_sheet(wb, df):
         "Interconnector BE": "9467BD",
         "Interconnector NL": "8C564B",
         "Interconnector IE": "E377C2",
-        "OCGT":          "FF0000",   # red
     }
 
     for r_idx, (_, row) in enumerate(df.iterrows(), 3):
         row_fill = WHITE if r_idx % 2 == 1 else PALE_BLUE
         plant = str(row["Marginal Plant"])
 
-        # Determine plant colour for price cell
-        if "CCGT" in plant:
-            m = re.search(r"T(\d)", plant)
+        # Determine plant colour for price cell — gas tranches shade from
+        # cheapest (green) to most expensive (dark red) by tranche number
+        if "CCGT" in plant or "OCGT" in plant:
+            m = re.search(r"T(\d+)", plant)
             t = int(m.group(1)) if m else 3
-            colours_ccgt = ["00B050","70AD47","FFC000","FF7C00","FF0000","C00000"]
-            pc = colours_ccgt[min(t-1, 5)]
+            colours_gas = ["00B050","70AD47","A9D18E","FFC000","FF9900",
+                           "FF7C00","FF0000","C00000"]
+            pc = colours_gas[min(t-1, len(colours_gas)-1)]
         else:
             pc = plant_colours.get(plant, "BFBFBF")
 
@@ -588,10 +597,14 @@ def write_results_sheet(wb, df):
             row["Demand (GW)"],
             row["Wind (GW)"],
             row["Solar (GW)"],
+            row["Hydro (GW)"],
+            row["Nuclear (GW)"],
+            row["Biomass (GW)"],
             plant,
             row["Price (£/MWh)"],
         ]
-        fmts = [None, None, "0", "0.00", "0.00", "0.00", None, "£#,##0.00"]
+        fmts = [None, None, "0", "0.00", "0.00", "0.00", "0.00", "0.00",
+                "0.00", None, "£#,##0.00"]
 
         for c_idx, (val, fmt) in enumerate(zip(values, fmts), 1):
             c = ws.cell(row=r_idx, column=c_idx, value=val)
@@ -614,12 +627,15 @@ def write_daily_summary_sheet(wb, df):
     ws.sheet_view.showGridLines = False
 
     daily = df.groupby("Date").agg(
-        Avg_Price  = ("Price (£/MWh)", "mean"),
-        Min_Price  = ("Price (£/MWh)", "min"),
-        Max_Price  = ("Price (£/MWh)", "max"),
-        Avg_Demand = ("Demand (GW)",   "mean"),
-        Avg_Wind   = ("Wind (GW)",     "mean"),
-        Avg_Solar  = ("Solar (GW)",    "mean"),
+        Avg_Price   = ("Price (£/MWh)", "mean"),
+        Min_Price   = ("Price (£/MWh)", "min"),
+        Max_Price   = ("Price (£/MWh)", "max"),
+        Avg_Demand  = ("Demand (GW)",   "mean"),
+        Avg_Wind    = ("Wind (GW)",     "mean"),
+        Avg_Solar   = ("Solar (GW)",    "mean"),
+        Avg_Hydro   = ("Hydro (GW)",    "mean"),
+        Avg_Nuclear = ("Nuclear (GW)",  "mean"),
+        Avg_Biomass = ("Biomass (GW)",  "mean"),
     ).reset_index()
     daily["Price_Range"] = daily["Max_Price"] - daily["Min_Price"]
     _peak = df.loc[df.groupby("Date")["Price (£/MWh)"].idxmax(),
@@ -773,7 +789,7 @@ def write_charts_sheet(wb, df, daily):
     ws.row_dimensions[1].height = 24
 
 
-def write_excel(df, daily, stack, run_time):
+def write_excel(df, stack, run_time):
     fname = f"gb_power_model_{run_time.strftime('%Y%m%d_%H%M')}.xlsx"
 
     wb = Workbook()
@@ -784,7 +800,7 @@ def write_excel(df, daily, stack, run_time):
     write_assumptions_sheet(wb, stack)
 
     print("Writing Daily Summary sheet...")
-    write_daily_summary_sheet(wb, df)
+    daily = write_daily_summary_sheet(wb, df)
 
     print("Writing Half-Hourly Results sheet...")
     write_results_sheet(wb, df)
@@ -824,21 +840,8 @@ if __name__ == "__main__":
     stack = build_stack()
     df    = run_model(forecasts, stack)
 
-    # Daily summary
-    daily = df.groupby("Date").agg(
-        Avg_Price  = ("Price (£/MWh)", "mean"),
-        Min_Price  = ("Price (£/MWh)", "min"),
-        Max_Price  = ("Price (£/MWh)", "max"),
-        Avg_Demand = ("Demand (GW)",   "mean"),
-        Avg_Wind   = ("Wind (GW)",     "mean"),
-        Avg_Solar  = ("Solar (GW)",    "mean"),
-        Peak_Period= ("Price (£/MWh)", lambda x: df.loc[df["Date"]==x.name,
-                      "Settlement Period"].iloc[x.argmax()]),
-    ).reset_index()
-    daily["Price_Range"] = daily["Max_Price"] - daily["Min_Price"]
-
     # Print console summary
-    print(f"\n=== Summary ===")
+    print("\n=== Summary ===")
     print(f"Periods modelled : {len(df)}")
     print(f"Avg price        : £{df['Price (£/MWh)'].mean():.2f}/MWh")
     print(f"Min price        : £{df['Price (£/MWh)'].min():.2f}/MWh")
@@ -849,5 +852,5 @@ if __name__ == "__main__":
 
     # Write Excel
     print("\nWriting Excel output...")
-    fname = write_excel(df, daily, stack, run_time)
+    fname = write_excel(df, stack, run_time)
     print(f"\nDone. Open: {fname}")
