@@ -5,9 +5,6 @@ wind and plant availability forecasts, clears each half-hour against the
 domestic stack and the interconnectors, and writes a formatted Excel workbook
 with half-hourly marginal plant and clearing prices 3 to 14 days ahead.
 
-Built to answer a question I kept running into as a market reporter: given
-what the system operator is forecasting for next week, what should the price
-be, and which plant is setting it?
 
 ```
 python run_model.py
