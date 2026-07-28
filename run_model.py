@@ -233,9 +233,15 @@ def load_forecasts() -> pd.DataFrame:
     df = wind.merge(emb,  on=["date", "sp"], how="inner")
     df = df.merge(dem, on=["date", "sp"], how="inner")
 
+    # Gross basis: embedded wind and solar appear on the supply side, so
+    # demand must be gross of them too. NESO NATIONALDEMAND is transmission
+    # system demand — embedded generation is already netted off it — so add
+    # the embedded forecasts back to avoid counting them twice.
     df["wind_gw"]   = (df["Wind_Forecast"] + df["EMBEDDED_WIND_FORECAST"]) / 1000
     df["solar_gw"]  = df["EMBEDDED_SOLAR_FORECAST"] / 1000
-    df["demand_gw"] = df["demand_mw"] / 1000
+    df["demand_gw"] = (df["demand_mw"]
+                       + df["EMBEDDED_WIND_FORECAST"]
+                       + df["EMBEDDED_SOLAR_FORECAST"]) / 1000
 
     df = df.sort_values(["date", "sp"]).set_index(["date", "sp"])
     print(f"  Loaded {len(df)} settlement periods: "
@@ -518,15 +524,21 @@ def write_assumptions_sheet(wb, stack):
     row_(ws, r, "System costs adder", "Not applied",
          "BSUoS/TNUoS/DUoS are non-commodity charges recovered separately "
          "and are not part of wholesale price formation", "", False); r += 1
+    row_(ws, r, "Demand basis", "Gross of embedded generation",
+         "NESO NATIONALDEMAND is transmission demand (embedded generation "
+         "already netted off); embedded wind and solar are added back so "
+         "they are not double-counted against the supply stack", "", False); r += 1
 
     r += 1
     section(r, "Data Sources"); r += 1
-    row_(ws, r, "Wind forecast",
-         "NESO Data Portal", "2-14 day ahead, half-hourly", "", False); r += 1
+    row_(ws, r, "Transmission wind forecast",
+         "NESO Data Portal", "14 day ahead, half-hourly", "", False); r += 1
     row_(ws, r, "Embedded wind & solar",
          "NESO Data Portal", "2-14 day ahead, half-hourly", "", False); r += 1
     row_(ws, r, "Demand forecast",
-         "NESO Data Portal", "2-14 day ahead, half-hourly", "", False); r += 1
+         "NESO Data Portal", "2-14 days ahead half hourly (NATIONALDEMAND)", "", False); r += 1
+    row_(ws, r, "Plant & interconnector availability",
+         "Elexon FOU2T14D", "2-14 day ahead, daily outputUsable", "", False); r += 1
 
 
 def write_results_sheet(wb, df):
