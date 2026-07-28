@@ -28,6 +28,7 @@ Output:
 import json
 import os
 import re
+import sys
 import xml.etree.ElementTree as ET
 
 import requests
@@ -286,7 +287,8 @@ def load_forward_inputs(fx: float) -> dict:
         if isinstance(nbp_raw, dict) and nbp_raw:
             nbp = pd.Series({pd.to_datetime(k).date(): float(v)
                              for k, v in nbp_raw.items() if v is not None})
-            nbp = nbp.sort_index()
+            # An untouched template is all nulls — treat that as "not supplied"
+            nbp = nbp.sort_index() if not nbp.empty else None
         elif isinstance(nbp_raw, (int, float)):
             nbp = float(nbp_raw)
 
@@ -325,7 +327,17 @@ def resolve_gas_curve(nbp, model_dates) -> pd.Series:
         s = s.ffill().bfill()
         if s.isna().any():
             s = s.fillna(GAS_PRICE_P_THERM)
-        if missing:
+        if missing == len(dates):
+            # Almost always a curve left over from an earlier run: the window
+            # rolls daily, so yesterday's dates stop overlapping. Nothing is
+            # carried across a disjoint window — fall back to the assumption
+            # rather than extrapolate a stale price over the whole run.
+            print(f"  WARNING: NBP curve covers {nbp.index.min()}.."
+                  f"{nbp.index.max()} but the model runs {dates[0]}..{dates[-1]}"
+                  f" — no overlap, so every day falls back to the hardcoded "
+                  f"{GAS_PRICE_P_THERM} p/therm. Regenerate with "
+                  f"--init-forward.")
+        elif missing:
             print(f"  NBP curve missing {missing}/{len(dates)} modelled "
                   f"date(s) — filled from nearest quoted day")
         return s
@@ -1168,7 +1180,58 @@ def write_excel(df, ic_shapes, ic_level_source, gas_curve, ets_price, run_time):
 # MAIN
 # ===========================================================================
 
+def model_dates() -> list:
+    """Every date the model will cover, given today's rolling window."""
+    start = date.today() + timedelta(days=MODEL_START_DAY)
+    return [start + timedelta(days=i)
+            for i in range(MODEL_END_DAY - MODEL_START_DAY + 1)]
+
+
+def write_forward_template(path: str = None) -> str:
+    """
+    Write a forward_levels.json pre-dated for today's window, values nulled.
+
+    The window rolls forward every day, so hand-typing dates goes stale
+    immediately. Generate the template, paste your assessments in, run. Nulls
+    are ignored by the loader, so a partly filled template is valid.
+    """
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                FORWARD_LEVELS_FILE)
+    if os.path.exists(path):
+        raise SystemExit(f"{path} already exists — delete or edit it rather "
+                         f"than overwriting assessments")
+    dates = model_dates()
+    blob = {
+        "_comment": [
+            f"Generated {date.today().isoformat()} for the window "
+            f"{dates[0].isoformat()} to {dates[-1].isoformat()}.",
+            "The window rolls daily, so regenerate rather than reusing this "
+            "file on a later day; the model warns if the curve stops "
+            "overlapping the window.",
+            "Nulls are ignored and fall back to the assumptions in "
+            "run_model.py. See forward_levels.example.json for field notes.",
+        ],
+        "currency": "EUR",
+        "levels": {label: None for _, label, _, _ in INTERCONNECTORS},
+        "nbp_p_therm": {d.isoformat(): None for d in dates},
+        "uk_ets_gbp_tonne": None,
+    }
+    with open(path, "w") as fh:
+        json.dump(blob, fh, indent=2)
+        fh.write("\n")
+    return path
+
+
 if __name__ == "__main__":
+    if "--init-forward" in sys.argv:
+        p = write_forward_template()
+        ds = model_dates()
+        print(f"Wrote {p}")
+        print(f"  {len(ds)} gas days, {ds[0]} to {ds[-1]}")
+        print("  Fill in and re-run. This file is gitignored — keep licensed "
+              "assessments out of the repository.")
+        raise SystemExit(0)
+
     run_time = datetime.now()
     print(f"GB Power Model — {run_time.strftime('%Y-%m-%d %H:%M')}")
     print(f"Forecast window: day {MODEL_START_DAY} to day {MODEL_END_DAY} ahead\n")
