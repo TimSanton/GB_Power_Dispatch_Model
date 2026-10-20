@@ -52,9 +52,9 @@ CPS_RATE_GBP_TONNE     = 18.0    # £/tonne CO2 — Carbon Price Support
 ETS_EMISSIONS          = 0.18422  # UKGHGI 2025 median LDZ, tCO2/MWh_th
 CPS_EMISSIONS          = 0.18259  # BEIS condensed set 2025, tCO2/MWh_th
 
-# Gas fleet — 8 tranches using Argus published efficiency breakpoints
+# Gas fleet — 8 tranches on standard thermal efficiency breakpoints
 # (30, 34, 36, 38, 40, 42, 46, 49, 55, 58, 60pc)
-# Capacities from NESO 2026/27 Final ALF data mapped to Argus efficiency bands
+# Capacities from NESO 2026/27 Final ALF data mapped to those efficiency bands
 # CCGT VOM: £5.00/MWh from DESNZ 2025 generation costs summary table (all gas plant, 2024 prices)
 # (efficiency, capacity_gw, vom_gbp_mwh)
 GAS_TRANCHES = [
@@ -120,7 +120,7 @@ INTERCONNECTORS = [
 # product, so a plant's fuel cost is flat across all 48 settlement periods,
 # and carbon has no intraday dimension at all.
 #
-# Argus (and any other) forward assessments are LICENSED DATA. This repository
+# Third-party forward assessments are LICENSED DATA. This repository
 # is public, so those numbers must not be committed to it — the file is
 # gitignored. See forward_levels.example.json for the format. Anything absent
 # falls back to the hardcoded assumptions above.
@@ -876,7 +876,7 @@ def write_assumptions_sheet(wb, ic_shapes, ic_level_source, gas_curve, ets_price
     r += 1
     section(r, f"Gas Fleet — {len(GAS_TRANCHES)} Efficiency Tranches"); r += 1
     _gas_avg = float(_g.mean()) if len(_g) else GAS_PRICE_P_THERM
-    row_(ws, r, "Source", "NESO 2026/27 Final ALF data, Argus efficiency bands",
+    row_(ws, r, "Source", "NESO 2026/27 Final ALF data, standard efficiency bands",
          f"SRMC shown at the window-average {_gas_avg:.2f} p/therm", "", False); r += 1
     for i, (eff, cap, vom) in enumerate(GAS_TRANCHES, 1):
         mc   = gas_mc(eff, vom, _gas_avg, ets_price)
